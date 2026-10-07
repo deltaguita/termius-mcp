@@ -14,6 +14,31 @@ An MCP server that lets an AI agent work in the terminal tabs you **already have
 Verified against Termius 10.1.3 (Electron 43.5.1) on macOS. It relies on Termius internals that
 are not a public API, so a Termius update can break it.
 
+## What kind of MCP is this?
+
+It is an **app-internals MCP over the Chrome DevTools Protocol (CDP)**: it drives a desktop
+Electron app the way browser-automation MCPs drive a web page, but one level lower than the DOM.
+
+| | Browser / DOM MCPs (Playwright, Puppeteer) | GUI / computer-use MCPs | termius-mcp |
+|---|---|---|---|
+| Transport | CDP or WebDriver | Screenshots, mouse and keyboard events | CDP (`Runtime.evaluate` on Termius' renderer) |
+| Reads | DOM elements, accessibility tree | Pixels (OCR / vision) | Termius' React/Redux state and the xterm.js text buffer |
+| Acts by | Clicking and typing into DOM elements | Moving the mouse, pressing keys on screen | Calling `terminal.input()` on the terminal object |
+| Needs the tab on screen | Yes | Yes | No |
+| Output is | Page text and element refs | A picture to interpret | Exact text, no OCR errors |
+
+Why not the DOM: Termius draws the terminal on an xterm.js canvas, so the text is not in the DOM
+at all, and a screenshot would have to be read back by OCR, where one wrong character in a path or
+IP changes the meaning. So the server injects a small script (`bridge.js`) into the renderer,
+locates the live objects through React internals, and reads and writes them directly.
+
+What that means in practice:
+
+- **Needs a debug port.** Termius must be started with `--remote-debugging-port`; see [SECURITY.md](SECURITY.md).
+- **Tied to Termius internals.** No public API is used, so an app update can break it.
+- **Not a general browser tool.** It refuses any page that is not Termius' own main window.
+- **Not a remote-shell tool.** It never opens connections; it uses tabs you have already logged in.
+
 ## Features
 
 | Area | What you get |
