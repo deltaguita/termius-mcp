@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - 2026-10-12
 
 ### Added
 - `connect_host(host, dry_run, wait)`: opens a saved Termius host in a new tab of the current
@@ -17,7 +17,7 @@
 - `connect_host` passes Termius' own live Host object to its connect function (the Redux copy
   lacks the getters it needs and made a real connect fail with a `TypeError`).
 
-## 0.1.0
+## 0.1.0 - 2026-10-08
 
 ### Added
 - Tools: `list_hosts`, `list_keychain`, `list_terminal_sessions`, `read_terminal`,
