@@ -136,6 +136,30 @@
 
   const identityOf = cfg => (cfg && cfg.identity) || null;
 
+  // The Hosts list component owns the code path behind "double-click a host":
+  // connectToHostsImpl({hosts, protocol, newWindow, quick, connectionOrigin}) turns each
+  // saved host into a connection and hands it to the app, which opens a tab. Calling
+  // the live instance means the app's own logic picks identity, jump hosts and keys;
+  // nothing secret is read or passed by us.
+  const findHostsList = () => {
+    const root = document.getElementById('root');
+    const key = root && Object.keys(root).find(k => k.startsWith('__reactContainer'));
+    if (!key) return null;
+    const queue = [root[key]];
+    for (let i = 0; i < queue.length && i < 60000; i++) {
+      const f = queue[i];
+      if (!f) continue;
+      try {
+        const n = f.stateNode;
+        if (n && typeof n === 'object' && !(n instanceof Node)
+            && typeof n.connectToHostsImpl === 'function') return n;
+      } catch (e) {}
+      if (f.child) queue.push(f.child);
+      if (f.sibling) queue.push(f.sibling);
+    }
+    return null;
+  };
+
   window.__kc = {
     version: 1,
 
@@ -226,6 +250,63 @@
       if (!a) throw new Error('terminal not found in Termius (neither mediator pool nor DOM) — switch to its tab once');
       const b = a.terminal.buffer.active;
       return { lines: logical(b, 0, b.length) };
+    },
+
+    // Open a SAVED host (exact label, case-insensitive, must be unique) in a new tab of
+    // this window. Never a free-form address and never a new window: a second main
+    // window would be invisible to this bridge. dryRun resolves everything and connects
+    // to nothing.
+    connectHost(label, dryRun) {
+      const want = String(label || '').trim().toLowerCase();
+      if (!want) throw new Error('host label is empty');
+      const hits = state().entities.hosts.filter(h => String(h.label || '').toLowerCase() === want);
+      if (hits.length === 0) throw new Error(`no saved host is labelled ${JSON.stringify(label)} (see list_hosts)`);
+      if (hits.length > 1) throw new Error(`${hits.length} saved hosts are labelled ${JSON.stringify(label)}; rename one in Termius`);
+      const list = findHostsList();
+      if (!list) throw new Error('Termius hosts list not found — open the Hosts screen once, then retry');
+      const h = hits[0];
+      // The redux copy is a plain object. The app's connect code calls getters that only
+      // exist on its own Host instances (getHostProtocol reads host.actions[0]), so the
+      // live instance that the Hosts list itself renders is what must be passed in.
+      const live = ((list.props && list.props.hosts) || []).filter(x => x.local_id === h.local_id);
+      if (live.length !== 1) throw new Error(`Hosts list holds ${live.length} live entries for ${JSON.stringify(h.label)}; nothing was opened`);
+      if (!dryRun) {
+        // connectionOrigin is analytics metadata; reuse a value the app itself sends.
+        list.connectToHostsImpl({ hosts: [live[0]], newWindow: false, connectionOrigin: 'Edit Host Screen' });
+      }
+      return { label: h.label || null, address: h.address || null, dry_run: !!dryRun };
+    },
+
+    // First-time host-key prompt ("The authenticity of <address> can not be established").
+    // Answers ONLY that prompt, and only when exactly one such prompt names `address`.
+    // A changed-key warning is a different dialog with different text: never matched.
+    // mode 'add' presses "Add and continue" (remembers the key, so a later change is
+    // caught); 'once' presses "Continue". Returns null when no prompt names the address.
+    answerHostKey(address, mode) {
+      const label = { add: 'Add and continue', once: 'Continue' }[mode];
+      if (!label) throw new Error(`unknown host-key mode ${JSON.stringify(mode)}`);
+      const want = String(address || '').trim();
+      if (!want) throw new Error('address is empty');
+      const prompts = [];
+      for (const b of document.querySelectorAll('button')) {
+        if ((b.textContent || '').trim() !== 'Add and continue') continue;
+        let n = b;
+        for (let i = 0; i < 12 && n.parentElement; i++) {
+          n = n.parentElement;
+          if (/can not be established/i.test(n.textContent || '')) break;
+        }
+        const t = n.textContent || '';
+        const m = /authenticity of (\S+) can not be established/i.exec(t);
+        if (!m || m[1] !== want) continue;
+        const btn = [...n.querySelectorAll('button')].filter(x => (x.textContent || '').trim() === label);
+        if (btn.length !== 1) throw new Error(`host-key prompt has ${btn.length} "${label}" buttons; nothing was pressed`);
+        const fp = /SHA256:\s*([A-Za-z0-9+\/=]+?)\s*Do you want/i.exec(t);
+        prompts.push({ btn: btn[0], fingerprint: fp ? 'SHA256:' + fp[1] : null });
+      }
+      if (prompts.length === 0) return null;
+      if (prompts.length > 1) throw new Error(`${prompts.length} host-key prompts name ${want}; nothing was pressed (answer them in Termius)`);
+      prompts[0].btn.click();
+      return { address: want, fingerprint: prompts[0].fingerprint, pressed: label };
     },
 
     input(id, data) {

@@ -50,6 +50,16 @@ This is a larger exposure than anything the agent itself can do.
   process, they share claims. If a process id is reused by the OS after a crash, a stale claim can
   look alive until the 15-minute idle limit.
 - **Claims are per tab id, not per window.** Several windows are refused rather than supported.
+- **`connect_host` can open a session to any saved host.** It is the one tool that creates access
+  rather than using an open tab. Only saved hosts are accepted (no free-form address), Termius'
+  own identity is used, and a password prompt is never answered. A first-time host-key prompt
+  ("authenticity ... can not be established") is answered per `TERMIUS_HOSTKEY` (default `add` =
+  "Add and continue", trust on first use) and the fingerprint is returned in the tool output. A
+  changed-key warning is a different dialog and is never answered. The prompt is matched by the
+  host's address; two prompts naming the same address are left to you. Set `TERMIUS_HOSTKEY=ask`
+  to answer nothing. Keep the tool on manual approval, and set `TERMIUS_CONNECT_ALLOW` to the labels an agent may open. The new tab
+  is found by diffing the tab list under a cross-process lock; if zero or several tabs match the
+  host label it claims nothing.
 - **Termius internals.** `bridge.js` depends on Termius' React and xterm structure; an update can
   break it. Breakage shows up as errors (`terminal not found`, `Termius state store not found`),
   not as typing into the wrong place, because input is addressed by session id and verified

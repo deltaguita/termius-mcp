@@ -36,10 +36,11 @@ function fakeTerminal(rows, cursorY = rows.length - 1, cursorX = 0) {
 }
 
 // ---- fake Termius renderer --------------------------------------------------
-function load({ terminals = {}, sessions = [], mounted = [], withPool = true, state = {} } = {}) {
+function load({ terminals = {}, sessions = [], mounted = [], withPool = true, state = {}, hostsList = null, buttons = [] } = {}) {
   const mediatorMap = new Map(
     Object.entries(terminals).map(([id, t]) => [id, { terminalApi: { id, terminal: t } }]));
-  const poolFiber = { memoizedProps: { singletons: { mediatorPool: { mediatorMap } } } };
+  const listFiber = hostsList ? { memoizedProps: null, stateNode: hostsList } : null;
+  const poolFiber = { memoizedProps: { singletons: { mediatorPool: { mediatorMap } } }, sibling: listFiber };
   const storeFiber = {
     memoizedProps: {
       store: {
@@ -49,13 +50,13 @@ function load({ terminals = {}, sessions = [], mounted = [], withPool = true, st
         }),
       },
     },
-    child: withPool ? poolFiber : null,
+    child: withPool ? poolFiber : listFiber,
   };
   const root = { '__reactContainer$x': { memoizedProps: null, child: storeFiber } };
   const mountedEls = new Set(mounted.map(id => terminals[id].element));
   const document = {
     getElementById: id => (id === 'root' ? root : null),
-    querySelectorAll: () => [],
+    querySelectorAll: sel => (sel === 'button' ? buttons : []),
     contains: el => mountedEls.has(el),
   };
   // Map is shared with the sandbox: bridge.js does `instanceof Map`, which fails across realms.
@@ -206,4 +207,113 @@ test('before_cursor ignores text to the right of the cursor', () => {
   const line = text('me@box % ls', false, 5);
   const kc = load({ terminals: { a: fakeTerminal([line], 0, 9) }, sessions: [SESSION('a')] });
   assert.equal(kc.read('a').before_cursor, 'me@box % ');
+});
+
+// ---- connectHost --------------------------------------------------------------
+let nextLocalId = 1;
+const HOST = (label, extra = {}) => ({ local_id: nextLocalId++, label, address: '10.0.0.' + label.length, ssh_config: { port: 22 }, ...extra });
+// The redux copy (state.entities.hosts) is plain data; the Hosts list holds the app's own
+// Host instances. Model that: live copies are distinct objects with the same local_id.
+function withList(hosts, liveHosts) {
+  const calls = [];
+  const live = liveHosts || hosts.map(h => ({ ...h, isLive: true }));
+  const hostsList = { connectToHostsImpl: arg => calls.push(arg), props: { hosts: live } };
+  return { calls, live, kc: load({ hostsList, state: { entities: { hosts } } }) };
+}
+
+test('connectHost opens the saved host in a tab of this window, never a new window', () => {
+  const h = HOST('web-1', { identity_secret: 'PW-SECRET' });
+  const { calls, live, kc } = withList([h, HOST('db-1')]);
+  const r = plain(kc.connectHost('WEB-1', false));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].hosts.length, 1);
+  assert.equal(calls[0].hosts[0], live[0]); // the app's live instance, not the redux copy
+  assert.equal(calls[0].newWindow, false);
+  assert.equal(r.label, 'web-1');
+  assert.ok(!JSON.stringify(r).includes('PW-SECRET'));
+});
+
+test('connectHost dryRun resolves the host and calls nothing', () => {
+  const { calls, kc } = withList([HOST('web-1')]);
+  assert.equal(kc.connectHost('web-1', true).dry_run, true);
+  assert.equal(calls.length, 0);
+});
+
+test('connectHost refuses unknown, empty and duplicate labels without connecting', () => {
+  const { calls, kc } = withList([HOST('web-1'), HOST('web-1'), HOST('db-1')]);
+  assert.throws(() => kc.connectHost('10.0.0.9', false), /no saved host/);
+  assert.throws(() => kc.connectHost('  ', false), /empty/);
+  assert.throws(() => kc.connectHost('web-1', false), /2 saved hosts/);
+  assert.equal(calls.length, 0);
+});
+
+test('connectHost refuses when the Hosts list has no live entry for the host', () => {
+  const { calls, kc } = withList([HOST('web-1')], []);
+  assert.throws(() => kc.connectHost('web-1', false), /0 live entries/);
+  assert.throws(() => kc.connectHost('web-1', true), /0 live entries/);
+  assert.equal(calls.length, 0);
+});
+
+test('connectHost fails clearly when the hosts list is not mounted', () => {
+  const kc = load({ state: { entities: { hosts: [HOST('web-1')] } } });
+  assert.throws(() => kc.connectHost('web-1', false), /hosts list not found/);
+});
+
+
+// ---- answerHostKey ------------------------------------------------------------
+// A prompt = a container holding the message and three buttons, like Termius' DOM.
+function prompt(address, { fp = 'YYDEmmEzEunsZXdgoxhAOVGGwCqfIEaLNmr1zsIhu+A', head = 'The authenticity of %A can not be established.' } = {}) {
+  const pressed = [];
+  const box = { textContent: '', parentElement: null, _b: [] };
+  const mk = name => { const b = { textContent: name, parentElement: box, click: () => pressed.push(name) }; return b; };
+  box._b = ['Close', 'Continue', 'Add and continue'].map(mk);
+  box.querySelectorAll = () => box._b;
+  box.textContent = `Are you sure you want to connect?${head.replace('%A', address)}RSA fingerprint is SHA256:${fp}Do you want to add it to the list of known hosts?CloseContinueAdd and continue`;
+  return { box, pressed, buttons: box._b };
+}
+
+test('answerHostKey presses "Add and continue" for the prompt naming the address and returns the fingerprint', () => {
+  const p = prompt('10.0.0.1');
+  const kc = load({ buttons: p.buttons });
+  const r = plain(kc.answerHostKey('10.0.0.1', 'add'));
+  assert.deepEqual(p.pressed, ['Add and continue']);
+  assert.equal(r.fingerprint, 'SHA256:YYDEmmEzEunsZXdgoxhAOVGGwCqfIEaLNmr1zsIhu+A');
+});
+
+test('answerHostKey "once" presses Continue, an unknown mode presses nothing', () => {
+  const p = prompt('10.0.0.1');
+  const kc = load({ buttons: p.buttons });
+  kc.answerHostKey('10.0.0.1', 'once');
+  assert.deepEqual(p.pressed, ['Continue']);
+  assert.throws(() => kc.answerHostKey('10.0.0.1', 'always'), /unknown host-key mode/);
+  assert.deepEqual(p.pressed, ['Continue']);
+});
+
+test('answerHostKey ignores a prompt for another address and returns null', () => {
+  const p = prompt('10.0.0.9');
+  const kc = load({ buttons: p.buttons });
+  assert.equal(kc.answerHostKey('10.0.0.1', 'add'), null);
+  assert.deepEqual(p.pressed, []);
+});
+
+test('answerHostKey never answers a changed-key warning', () => {
+  const p = prompt('10.0.0.1', { head: 'WARNING: REMOTE HOST IDENTIFICATION FOR %A HAS CHANGED!' });
+  const kc = load({ buttons: p.buttons });
+  assert.equal(kc.answerHostKey('10.0.0.1', 'add'), null);
+  assert.deepEqual(p.pressed, []);
+});
+
+test('answerHostKey refuses when two prompts name the same address', () => {
+  const a = prompt('10.0.0.1'), b = prompt('10.0.0.1');
+  const kc = load({ buttons: [...a.buttons, ...b.buttons] });
+  assert.throws(() => kc.answerHostKey('10.0.0.1', 'add'), /2 host-key prompts/);
+  assert.deepEqual([...a.pressed, ...b.pressed], []);
+});
+
+test('answerHostKey with only the other prompt present answers just that one', () => {
+  const a = prompt('10.0.0.1'), b = prompt('10.0.0.2');
+  const kc = load({ buttons: [...a.buttons, ...b.buttons] });
+  kc.answerHostKey('10.0.0.2', 'add');
+  assert.deepEqual(a.pressed, []);
+  assert.deepEqual(b.pressed, ['Add and continue']);
 });

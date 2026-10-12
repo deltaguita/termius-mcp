@@ -352,6 +352,117 @@ async def list_hosts(query: str | None = None) -> str:
     return "\n".join(rows) or "(no hosts)"
 
 
+CONNECT_WAIT_MAX = 120
+
+
+def _connect_allowed(label: str) -> bool:
+    """TERMIUS_CONNECT_ALLOW (comma separated labels) limits connect_host. Unset = any
+    saved host; the client's per-call approval is then the only gate."""
+    raw = os.environ.get("TERMIUS_CONNECT_ALLOW", "").strip()
+    if not raw:
+        return True
+    return label.strip().lower() in {x.strip().lower() for x in raw.split(",") if x.strip()}
+
+
+def _hostkey_mode() -> str:
+    """TERMIUS_HOSTKEY: what connect_host does with a first-time host-key prompt.
+    add (default) = press "Add and continue" (trust on first use, key remembered so a
+    later change is NOT auto-accepted); once = press "Continue"; ask = press nothing."""
+    m = os.environ.get("TERMIUS_HOSTKEY", "add").strip().lower()
+    return m if m in ("add", "once", "ask") else "ask"
+
+
+@contextlib.asynccontextmanager
+async def _connect_lock():
+    """One connect at a time across all MCP processes: the new tab is found by diffing
+    the tab list, so two simultaneous connects could each take the other's tab."""
+    LOCK_DIR.mkdir(mode=0o700, exist_ok=True)
+    fd = os.open(LOCK_DIR / "connect.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 30
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if loop.time() >= deadline:
+                    raise RuntimeError("another connect_host call is in progress; "
+                                       "nothing was opened. Retry shortly.") from None
+                await asyncio.sleep(0.2)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+@mcp.tool(annotations=EXEC)
+async def connect_host(host: str, dry_run: bool = False, wait: int = 30) -> str:
+    """Open a SAVED Termius host (exact label from list_hosts) in a NEW TAB of the
+    current window, wait until it is connected, and claim the new tab for this session.
+    Termius' own saved identity / key / jump hosts are used; no credential is read or
+    passed here. Only saved hosts: no free-form address, no new window. A first-time
+    host-key prompt is answered per TERMIUS_HOSTKEY (default: "Add and continue", the
+    fingerprint is reported back; a CHANGED key is never accepted). A password prompt
+    is NOT answered: read_terminal and ask the human.
+    `dry_run=true` only checks that the host and Termius' connect function are found.
+    TERMIUS_CONNECT_ALLOW (comma separated labels) can restrict which hosts are allowed."""
+    if not _connect_allowed(host):
+        raise RuntimeError(f"host {host!r} is not in TERMIUS_CONNECT_ALLOW; nothing was opened.")
+    wait = max(1, min(int(wait), CONNECT_WAIT_MAX))
+    async with Page() as p:
+        # Several main windows: the new tab might land in one this server cannot see.
+        if p.windows > 1:
+            raise RuntimeError(_window_warning(p) + " Nothing was opened.")
+        async with _connect_lock():
+            before = {s["id"] for s in await p.call("sessions")}
+            res = await p.call("connectHost", host, dry_run)
+            if dry_run:
+                return (f"dry run ok: would open {res['label']} ({res['address']}) "
+                        "in a new tab; nothing was opened.")
+            want = (res["label"] or "").lower()
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + wait
+            new: list[dict] = []
+            hostkey = None          # what we pressed on a first-time host-key prompt
+            hostkey_err = None
+            mode = _hostkey_mode()
+            while True:
+                await asyncio.sleep(0.5)
+                new = [s for s in await p.call("sessions")
+                       if s["id"] not in before and (s["host"] or "").lower() == want]
+                if len(new) == 1 and not new[0]["connected"] and mode != "ask" \
+                        and hostkey is None and hostkey_err is None:
+                    try:
+                        hostkey = await p.call("answerHostKey", res["address"], mode)
+                    except RuntimeError as e:      # several prompts name it: leave to the human
+                        hostkey_err = str(e)
+                if len(new) > 1 or (len(new) == 1 and new[0]["connected"]) \
+                        or loop.time() >= deadline:
+                    break
+            if len(new) != 1:
+                what = "several new tabs appeared" if new else "no new tab appeared"
+                raise RuntimeError(f"{what} for {res['label']} within {wait}s; nothing was "
+                                   "claimed. Check list_terminal_sessions.")
+            s = new[0]
+            with _claims_mutex():
+                _write_claim(s["id"])
+    state = ("connected" if s["connected"]
+             else f"NOT connected after {wait}s (host-key / password prompt or a failure? "
+                  "read_terminal, do not guess an answer)")
+    note = ""
+    if hostkey:
+        note = (f" First-time host key {hostkey['fingerprint'] or '(fingerprint unreadable)'} "
+                f"for {hostkey['address']} was accepted via \"{hostkey['pressed']}\" "
+                "(TERMIUS_HOSTKEY); verify it if this host is new to you.")
+    elif hostkey_err:
+        note = f" Host-key prompt left unanswered: {hostkey_err}"
+    return (f"[{s['name']}] opened as tab {s['id'][:8]} — {state}.{note} Claimed by this "
+            f"session; use session='{s['id'][:8]}'.")
+
+
 @mcp.tool(annotations=READ)
 async def list_keychain() -> str:
     """List Termius keychain entries by name only: identities (with whether a password
