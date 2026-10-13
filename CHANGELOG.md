@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0 - 2026-10-13
+
+### Changed
+- `connect_host` reuses a tab that the same session's earlier `connect_host` opened, instead of always
+  opening a new one. Opened tabs are recorded in the lock directory (`<tab id>.opened`) and shown by
+  `list_terminal_sessions` as `opened by agent`. Tabs a human or another session opened are never
+  reused implicitly. A reusable tab must be unclaimed or claimed by the calling session; one claimed
+  by another session is never taken and no duplicate is opened. Several free tabs are refused as
+  ambiguous. New parameter `new_tab` forces a separate tab.
+
 ## 0.2.0 - 2026-10-12
 
 ### Added

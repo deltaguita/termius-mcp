@@ -46,7 +46,7 @@ What that means in practice:
 | Read | `list_hosts`, `list_keychain` (names only, whitelisted fields), `list_terminal_sessions`, `read_terminal` (screen or full scrollback) |
 | Execute | `run_command` types one command, waits for the prompt to return, returns only that command's output (echo and prompt stripped) |
 | Low-level input | `send_text` (no Enter), `send_key` (enter, ctrl-c, ctrl-u, arrows, ...) |
-| Connect | `connect_host` opens a **saved** host in a new tab of the current window, waits until it is connected and claims the tab for the calling session |
+| Connect | `connect_host` gives the calling session a tab for a **saved** host: it reuses a tab of that host that **this session's** earlier `connect_host` opened (and nobody else has claimed), and opens a new tab of the current window otherwise. Tabs a human or another session opened are never reused implicitly. The tab is claimed for the session |
 | Multi-agent safety | `claim_terminal` / `release_terminal`; one input call per tab at a time; input refused when the tab list is incomplete (multiple windows) |
 | Output filtering | ANSI stripped, trailing whitespace trimmed, blank runs collapsed, output over 200 lines keeps head and tail with an omitted-lines marker |
 | Wide characters | Soft-wrapped rows are re-joined into logical lines; CJK and emoji are handled (verified with 130 wide characters across several rows) |
@@ -63,7 +63,7 @@ Not included: opening a local terminal or a new window, connecting to an address
 | `list_keychain()` | read | Identities (only whether a password exists), SSH key names, hardware key names, known-host key types |
 | `list_terminal_sessions()` | read | Open tabs: id prefix, name, protocol, address, connection state, `active`, `background`, claim owner |
 | `read_terminal(session?, lines=40, scrollback=false)` | read | Last `lines` lines of the screen, or the whole history (capped at 200 lines) |
-| `connect_host(host, dry_run=false, wait=30)` | **execute** | Open the saved host whose label equals `host` (case-insensitive) in a new tab, wait up to `wait` s (max 120) for the connection, claim the new tab. `dry_run` only checks that the host and Termius' connect function are found |
+| `connect_host(host, dry_run=false, wait=30, new_tab=false)` | **execute** | For the saved host whose label equals `host` (case-insensitive): reuse a connected tab of that host that this session's previous `connect_host` opened and that is unclaimed or already yours, and claim it; otherwise open a new tab, wait up to `wait` s (max 120) for the connection and claim it. A tab held by another session is never taken and no duplicate is opened behind it (the call fails and names the holder). Several free tabs are ambiguous and fail. `new_tab=true` always opens a separate tab. `dry_run` opens and claims nothing and reports whether it would reuse or open |
 | `claim_terminal(session)` | claim | Take exclusive input rights on a tab |
 | `release_terminal(session)` | claim | Give them up (only the owner can) |
 | `send_text(text, session)` | input | Type text without pressing Enter; rejects newlines |
@@ -199,7 +199,7 @@ uv run --script tests/smoke_live.py "Local Terminal"
 | `tests/test_filters.py` | ANSI stripping, blank-run collapsing, head/tail capping, prompt and cursor-position detection, key table |
 | `tests/test_claims_and_locks.py` | Claim ownership, dead owner, idle expiry, corrupt claim file, cross-process lock, lock released on crash, lock directory permissions |
 | `tests/test_tools.py` | Every input tool refused without a claim and nothing typed; target resolution; `run_command` against a running, half-typed, progress-line or still-drawing tab, and a stalled progress line not mistaken for completion; claim not stolen when a command outlives its claim |
-| `tests/test_connect.py` | `connect_host`: opens and claims only the new tab, unknown/duplicate labels and allow-list refused before anything opens, dry run opens nothing, several windows refused, no-new-tab / ambiguous tabs not claimed, a tab opened earlier by a human never taken |
+| `tests/test_connect.py` | `connect_host`: reuses a tab this session opened itself (registry), never a human-opened tab, another session's tab or one claimed elsewhere, `list_terminal_sessions` shows who opened a tab, `new_tab` always opens, opens and claims only the new tab, unknown/duplicate labels and allow-list refused before anything opens, dry run opens nothing, several windows refused, no-new-tab / ambiguous tabs not claimed, a tab opened earlier by a human never taken |
 | `tests/test_multi_window.py` | Window counting and selection, input/claims refused with several windows, partial-view warning on reads |
 | `tests/bridge.test.js` | No secrets in `hosts`/`keychain`/`sessions`; pool lookup for unmounted tabs; no cross-tab delivery; wide-character row joining; cursor-position text for prompt detection; `connectHost` resolves a unique saved host, never opens a new window, never returns host data |
 | `tests/smoke_live.py` | End-to-end on a real local tab (12 checks, including a running progress line) |

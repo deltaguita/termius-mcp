@@ -305,6 +305,28 @@ def _write_claim(tab_id: str, since: float | None = None) -> None:
     os.replace(tmp, p)
 
 
+def _opened_path(tab_id: str) -> Path:
+    return LOCK_DIR / (re.sub(r"[^A-Za-z0-9_-]", "_", tab_id) + ".opened")
+
+
+def _mark_opened(tab_id: str) -> None:
+    """Record that connect_host (not a human) opened this tab. Survives the opener's exit, so
+    a later session can reuse the tab; whether it may is still decided by the claim."""
+    LOCK_DIR.mkdir(mode=0o700, exist_ok=True)
+    p = _opened_path(tab_id)
+    tmp = p.with_suffix(".otmp")
+    tmp.write_text(json.dumps({"session": OWNER["session"], "token": OWNER["token"],
+                               "pid": OWNER["pid"], "at": time.time()}))
+    os.replace(tmp, p)
+
+
+def _read_opened(tab_id: str) -> dict | None:
+    try:
+        return json.loads(_opened_path(tab_id).read_text())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
 def _mine(c: dict | None) -> bool:
     return bool(c) and c.get("token") == OWNER["token"]
 
@@ -398,10 +420,47 @@ async def _connect_lock():
         os.close(fd)
 
 
+def _reuse_tab(sessions: list[dict], want: str, label: str, claim: bool) -> dict | None:
+    """A connected tab of host `want` this session opened and may use, claimed if `claim`.
+    Own claim first, then an unclaimed one. None = no tab of that host at all (open one).
+    Raises when tabs exist but cannot be used safely, so the caller never opens a duplicate
+    behind another session's back."""
+    # Only tabs THIS session opened through connect_host. A tab a human opened, or one another
+    # session opened, is never taken implicitly (claim_terminal does that, explicitly).
+    tabs = [s for s in sessions if (s["host"] or "").lower() == want and s["connected"]
+            and (_read_opened(s["id"]) or {}).get("token") == OWNER["token"]]
+    if not tabs:
+        return None
+    with _claims_mutex():
+        claims = {t["id"]: _read_claim(t["id"]) for t in tabs}
+        mine = [t for t in tabs if _mine(claims[t["id"]])]
+        free = [t for t in tabs if not claims[t["id"]]]
+        pick = mine or free
+        if len(pick) == 1:
+            if claim:
+                t = pick[0]
+                _write_claim(t["id"], claims[t["id"]]["since"] if claims[t["id"]] else None)
+            return pick[0]
+        if len(pick) > 1:
+            ids = ", ".join(t["id"][:8] for t in pick)
+            raise RuntimeError(f"{len(pick)} tabs of {label} are available ({ids}); nothing was "
+                               "opened or claimed. Pick one with claim_terminal, or pass "
+                               "new_tab=true.")
+        held = "; ".join(f"{t['id'][:8]} by {_describe(claims[t['id']])}" for t in tabs)
+        raise RuntimeError(f"every connected tab of {label} is claimed by another session "
+                           f"({held}); nothing was opened. Wait for release, or pass "
+                           "new_tab=true to open a separate tab.")
+
+
 @mcp.tool(annotations=EXEC)
-async def connect_host(host: str, dry_run: bool = False, wait: int = 30) -> str:
-    """Open a SAVED Termius host (exact label from list_hosts) in a NEW TAB of the
-    current window, wait until it is connected, and claim the new tab for this session.
+async def connect_host(host: str, dry_run: bool = False, wait: int = 30,
+                       new_tab: bool = False) -> str:
+    """Get a tab for a SAVED Termius host (exact label from list_hosts). A tab that
+    THIS session's connect_host opened earlier (list_terminal_sessions marks it "opened by
+    agent: THIS session") and that nobody else has claimed is REUSED; otherwise a NEW TAB is
+    opened (wait until connected, then claim). Tabs a human or another session opened are
+    never reused implicitly. `new_tab=true` always opens a new tab. A tab claimed by another session is
+    never taken: the call fails and says who holds it.
     Termius' own saved identity / key / jump hosts are used; no credential is read or
     passed here. Only saved hosts: no free-form address, no new window. A first-time
     host-key prompt is answered per TERMIUS_HOSTKEY (default: "Add and continue", the
@@ -417,11 +476,24 @@ async def connect_host(host: str, dry_run: bool = False, wait: int = 30) -> str:
         if p.windows > 1:
             raise RuntimeError(_window_warning(p) + " Nothing was opened.")
         async with _connect_lock():
-            before = {s["id"] for s in await p.call("sessions")}
-            res = await p.call("connectHost", host, dry_run)
+            existing = await p.call("sessions")
+            before = {s["id"] for s in existing}
+            # Resolve the label first (dry run opens nothing) so reuse can be checked.
+            res = await p.call("connectHost", host, True)
+            want = (res["label"] or "").lower()
+            if not new_tab:
+                reuse = _reuse_tab(existing, want, res["label"], claim=not dry_run)
+                if reuse:
+                    if dry_run:
+                        return (f"dry run ok: would reuse tab {reuse['id'][:8]} "
+                                f"({res['label']}); nothing was opened or claimed.")
+                    return (f"[{reuse['name']}] reused existing tab {reuse['id'][:8]} - connected. "
+                            f"Claimed by this session; use session='{reuse['id'][:8]}'. "
+                            "Pass new_tab=true to open a separate tab instead.")
             if dry_run:
                 return (f"dry run ok: would open {res['label']} ({res['address']}) "
                         "in a new tab; nothing was opened.")
+            res = await p.call("connectHost", host, False)
             want = (res["label"] or "").lower()
             loop = asyncio.get_running_loop()
             deadline = loop.time() + wait
@@ -448,6 +520,7 @@ async def connect_host(host: str, dry_run: bool = False, wait: int = 30) -> str:
                                    "claimed. Check list_terminal_sessions.")
             s = new[0]
             with _claims_mutex():
+                _mark_opened(s["id"])
                 _write_claim(s["id"])
     state = ("connected" if s["connected"]
              else f"NOT connected after {wait}s (host-key / password prompt or a failure? "
@@ -504,6 +577,10 @@ async def list_terminal_sessions() -> str:
             cols.append("background")
         with _claims_mutex():
             c = _read_claim(s["id"])
+        o = _read_opened(s["id"])
+        if o:
+            cols.append("opened by agent: THIS session" if o.get("token") == OWNER["token"]
+                        else f"opened by agent: session {o.get('session')}")
         if c:
             cols.append("claimed by THIS session" if _mine(c) else f"claimed by {_describe(c)}")
         rows.append("\t".join(cols))
